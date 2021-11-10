@@ -1,0 +1,369 @@
+diff --git a/modules/ngx_http_ssl_qat_module/README b/modules/ngx_http_ssl_qat_module/README
+new file mode 100644
+index 00000000..c028c4b2
+--- /dev/null
++++ b/modules/ngx_http_ssl_qat_module/README
+@@ -0,0 +1,34 @@
++# Copyright (C) Intel, Inc.
++
++This module is developed for TLS acceleration by offloading asymmetric
++operations to QAT accelerator within the BoringSSL framework, which is
++powered by Nginx dynamic module framework.
++
++Dependency
++BoringSSL* 5e7229488844e987207b377968b3cf0340bc4ccf
++QAT BoringSSL library v0.0.1
++
++Installation
++1. Add below configuration line into the config.example
++	    --add-dynamic-module=modules/ngx_http_ssl_qat_module
++2. Build Nginx with the addon modules, for example
++	    $ ./auto/configure --prefix=<path/to/install/dir> --with-http_v3_module --with-cc-opt="-I<path/to/qat_engine/sourcecode> -I<path/to/boringssl/include>" --with-ld-opt="-Wl,-rpath=<path/to/boringssl/lib> -L<path/to/boringssl/lib>" --add-dynamic-module=modules/ngx_http_ssl_qat_module
++	    $ make && make install
++
++Configuration
++
++1. Add dynamic loading configuration in nginx.conf
++    $ load_module modules/ngx_http_ssl_qat_module.so;
++
++
++Directives
++
++    Syntax:     ssl_qat on|off;
++    Default:    ssl_qat off;
++    Context:    http, server
++    Dependency: This feature depends on QAT_Engine.
++    Description:
++                Control the on|off of the QAT_Engine offloading.
++                If on is set, nginx_http_ssl_qat_module will register
++                QAT powered ssl_private_key_methods to the BoringSSL.
++                And initialize/finish the QAT for each worker.
+diff --git a/modules/ngx_http_ssl_qat_module/config b/modules/ngx_http_ssl_qat_module/config
+new file mode 100644
+index 00000000..606c3b81
+--- /dev/null
++++ b/modules/ngx_http_ssl_qat_module/config
+@@ -0,0 +1,16 @@
++# Copyright (C) Intel, Inc.
++
++ngx_addon_name=ngx_http_ssl_qat_module
++
++if test -n "$ngx_module_link"; then
++    ngx_module_type=HTTP
++    ngx_module_name=ngx_http_ssl_qat_module
++    ngx_module_incs=""
++    ngx_module_srcs="$ngx_addon_dir/ngx_http_ssl_qat_module.c"
++    ngx_module_libs="-lqatengine"
++
++    . auto/module
++else
++    SSL_ENGINE_MODULES="$HTTP_MODULES ngx_http_ssl_qat_module"
++    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_ssl_qat_module.c"
++fi
+diff --git a/modules/ngx_http_ssl_qat_module/ngx_http_ssl_qat_module.c b/modules/ngx_http_ssl_qat_module/ngx_http_ssl_qat_module.c
+new file mode 100644
+index 00000000..eda8b914
+--- /dev/null
++++ b/modules/ngx_http_ssl_qat_module/ngx_http_ssl_qat_module.c
+@@ -0,0 +1,301 @@
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_http.h>
++#include <ngx_log.h>
++#include "qat_bssl.h"
++#include "qat_utils.h"//todo log need to be replaced by nginx log.
++
++extern int engine_inited;
++int status = -1;
++void *result = NULL;
++
++static void ngx_qat_init_child_at_fork_handler(void) {
++    if (!engine_inited) {
++        ENGINE_load_qat();
++    }
++}
++
++static void ngx_qat_finish_before_fork_handler(void) {
++    if (engine_inited)
++        ENGINE_unload_qat();
++}
++
++static enum ssl_private_key_result_t
++ngx_priv_sign(SSL* ssl, uint8_t *out, size_t *out_len, size_t max_out,
++        uint16_t signature_algorithm, const uint8_t* in, size_t in_len) {
++    EVP_PKEY *pkey = NULL;
++    RSA *rsa = NULL;
++    const EVP_MD *md = NULL;
++    EVP_MD_CTX *ctx;
++    int len = 0;
++    unsigned char hash[EVP_MAX_MD_SIZE];
++    unsigned int hash_len;
++    unsigned char* msg;
++    size_t msg_len;
++    int prefix_allocated = 0;
++    int padding = RSA_NO_PADDING;
++
++    DEBUG("- Started private encryption\n");
++
++    /* Check if the SSL instance has correct data attached to it */
++    if (NULL == (pkey = SSL_get_privatekey(ssl))) {
++        goto error;
++    }
++
++    if (NULL == (rsa = EVP_PKEY_get0_RSA(pkey))) {
++        goto error;
++    }
++
++    if (EVP_PKEY_id(pkey) !=
++        SSL_get_signature_algorithm_key_type(signature_algorithm)) {
++        WARN("Key type not match signature algorithm.\n");
++        goto error;
++    }
++
++    /* Determine the hash */
++    ctx = EVP_MD_CTX_new();
++    md = SSL_get_signature_algorithm_digest(signature_algorithm);
++
++    /* Calculate the digest for signing */
++    if (!EVP_DigestInit_ex(ctx, md, NULL) ||
++        !EVP_DigestUpdate(ctx, in, in_len) ||
++        !EVP_DigestFinal_ex(ctx, hash, &hash_len)) {
++        WARN("-- Failed to calculate the digest.\n");
++        goto error;
++    }
++
++    /* Add RSA padding to the the hash. Supported types are PSS and PKCS1 */
++    if (SSL_is_signature_algorithm_rsa_pss(signature_algorithm)) {
++        msg_len = RSA_size(rsa);
++        if (NULL == (msg = OPENSSL_malloc(msg_len))) {
++            WARN("-- Failed to allocate memory.\n");
++            goto error;
++        }
++        prefix_allocated = 1;
++        if (!RSA_padding_add_PKCS1_PSS_mgf1(rsa, msg, hash, md, NULL, -1)) {
++            WARN("-- Failed to do pss padding.\n");
++            goto error;
++        }
++        padding = RSA_NO_PADDING;
++    } else {
++        if (!RSA_add_pkcs1_prefix(&msg, &msg_len, &prefix_allocated, \
++            EVP_MD_type(md), hash, hash_len)) {
++            goto error;
++        }
++        padding = RSA_PKCS1_PADDING;
++    }
++
++    if (!(len = RSA_meth_get_priv_enc(RSA_PKCS1_BSS())
++                        (msg_len, msg, out, rsa, padding))) {
++        WARN("-- Failed RSA_meth_get_priv_enc\n");
++        goto error;
++    }
++    *out_len = len;
++
++    DEBUG("- Finished private encryption\n");
++    OPENSSL_free(msg);
++    return ssl_private_key_success;
++error:
++    if (prefix_allocated) {
++        OPENSSL_free(msg);
++    }
++    return ssl_private_key_failure;
++}
++
++static enum ssl_private_key_result_t
++ngx_priv_dec(SSL* ssl, uint8_t *out, size_t *out_len,
++         size_t max_out, const uint8_t* in, size_t in_len) {
++    EVP_PKEY *pkey = NULL;
++    RSA *rsa = NULL;
++    int len = 0;
++
++    DEBUG("- Started\n");
++
++    /* Check if the SSL instance has correct data attached to it */
++    if (NULL == (pkey = SSL_get_privatekey(ssl))) {
++        return ssl_private_key_failure;
++    }
++
++    if (NULL == (rsa = EVP_PKEY_get0_RSA(pkey))) {
++        return ssl_private_key_failure;
++    }
++
++    if (0 == (len = RSA_meth_get_priv_dec(RSA_PKCS1_BSS())
++                            (in_len, in, out, rsa, RSA_NO_PADDING))) {
++        WARN("-- Failed in RSA_meth_get_priv_dec\n");
++        return ssl_private_key_failure;
++    }
++    *out_len = len;
++
++    DEBUG("- Finished private decryption\n");
++    return ssl_private_key_success;
++}
++
++static enum ssl_private_key_result_t
++ngx_complete(SSL* ssl, uint8_t* out, size_t* out_len, size_t max_out) {
++
++    if (status != 0) {
++        bssl_free_result(result);
++        return ssl_private_key_failure;
++      }
++
++    *out_len = bssl_get_result_len(result);
++    if (*out_len > max_out) {
++        bssl_free_result(result);
++        return ssl_private_key_failure;
++    }
++
++    bssl_copy_result(out,result);
++    bssl_free_result(result);
++
++    return ssl_private_key_success;
++}
++
++static const SSL_PRIVATE_KEY_METHOD
++qat_bssl_priv_key_method = {
++    ngx_priv_sign,
++    ngx_priv_dec,
++    ngx_complete,
++};
++
++static void *
++ngx_http_ssl_qat_create_conf(ngx_conf_t *cf);
++
++static char *
++ngx_http_ssl_qat_merge_conf(ngx_conf_t *cf, void *parent, void *child);
++
++static ngx_int_t
++ngx_http_ssl_qat_init(ngx_conf_t *cf);
++
++static void ngx_http_ssl_qat_exit(ngx_cycle_t *cycle);
++
++
++typedef struct {
++    ngx_str_t                       ssl_qat;
++} ngx_http_ssl_qat_conf_t;
++
++static ngx_command_t  ngx_http_ssl_qat_commands[] = {
++
++    { ngx_string("ssl_qat"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_str_slot,
++      NGX_HTTP_SRV_CONF_OFFSET,
++      offsetof(ngx_http_ssl_qat_conf_t, ssl_qat),
++      NULL },
++
++      ngx_null_command
++};
++
++static ngx_http_module_t  ngx_http_ssl_qat_module_ctx = {
++    NULL,                                  /* preconfiguration */
++    ngx_http_ssl_qat_init,                 /* postconfiguration */
++
++    NULL,                                  /* create main configuration */
++    NULL,                                  /* merge main configuration */
++
++    ngx_http_ssl_qat_create_conf,          /* create server configuration */
++    ngx_http_ssl_qat_merge_conf,           /* merge server configuration */
++
++    NULL,                                  /* create location configuration */
++    NULL                         /* init location configuration */
++};
++
++ngx_module_t  ngx_http_ssl_qat_module = {
++    NGX_MODULE_V1,
++    &ngx_http_ssl_qat_module_ctx,          /* module context */
++    ngx_http_ssl_qat_commands,             /* module directives */
++    NGX_HTTP_MODULE,                       /* module type */
++    NULL,                                  /* init master */
++    NULL,                                  /* init module */
++    NULL,                                  /* init process */
++    NULL,                                  /* init thread */
++    NULL,                                  /* exit thread */
++    ngx_http_ssl_qat_exit,                 /* exit process */
++    NULL,                                  /* exit master */
++    NGX_MODULE_V1_PADDING
++};
++
++
++static void *
++ngx_http_ssl_qat_create_conf(ngx_conf_t *cf)
++{
++    ngx_http_ssl_qat_conf_t  *conf;
++
++    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_ssl_qat_conf_t));
++    if (conf == NULL) {
++        return NULL;
++    }
++
++    /*
++     * set by ngx_pcalloc():
++     *
++     *     conf->bufs.num = 0;
++     *     conf->types = { NULL };
++     *     conf->types_keys = NULL;
++     */
++
++    return conf;
++}
++
++
++static char *
++ngx_http_ssl_qat_merge_conf(ngx_conf_t *cf, void *parent, void *child)
++{
++    ngx_http_ssl_qat_conf_t *prev = parent;
++    ngx_http_ssl_qat_conf_t *conf = child;
++
++    ngx_conf_merge_str_value(conf->ssl_qat, prev->ssl_qat, "off");
++
++    return NGX_CONF_OK;
++}
++
++
++static ngx_int_t
++ngx_http_ssl_qat_init(ngx_conf_t *cf)
++{
++    ngx_uint_t                   s;
++    ngx_http_ssl_qat_conf_t     *sqcf;
++    ngx_http_ssl_srv_conf_t     *sscf;
++    ngx_http_core_srv_conf_t   **cscfp;
++    ngx_http_core_main_conf_t   *cmcf;
++
++    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
++    cscfp = cmcf->servers.elts;
++
++    /* Set ssl.ctx for each server block */
++    for (s = 0; s < cmcf->servers.nelts; s++) {
++
++        sscf = cscfp[s]->ctx->srv_conf[ngx_http_ssl_module.ctx_index];
++        if (sscf->ssl.ctx == NULL) {
++            continue;
++        }
++
++        sqcf = cscfp[s]->ctx->srv_conf[ngx_http_ssl_qat_module.ctx_index];
++        if (sqcf->ssl_qat.len && 0 == ngx_strcmp(sqcf->ssl_qat.data, "on")) {
++            /* qat_async_private_key_method only supports RSA algorithm for now */
++            X509 *x509 = SSL_CTX_get0_certificate(sscf->ssl.ctx);
++            if (x509 == NULL) {
++                continue;
++            }
++
++            EVP_PKEY *pubkey = X509_get_pubkey(x509);
++            if (pubkey == NULL) {
++                continue;
++            }
++
++            if (EVP_PKEY_id(pubkey) == EVP_PKEY_RSA) {
++                ENGINE_load_qat();
++                SSL_CTX_set_private_key_method(sscf->ssl.ctx, &qat_bssl_priv_key_method);
++                pthread_atfork(ngx_qat_finish_before_fork_handler, NULL,
++                               ngx_qat_init_child_at_fork_handler);
++            }
++        }
++    }
++    return NGX_OK;
++}
++
++
++static void ngx_http_ssl_qat_exit(ngx_cycle_t *cycle)
++{
++    ENGINE_unload_qat();
++}
